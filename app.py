@@ -1,0 +1,749 @@
+#!/usr/bin/env python3
+"""
+CHEM740 Reaction Map – Interactive Browser Viewer
+===================================================
+Parses a Lucidchart JSON export and serves an interactive,
+physics-based graph via Dash + Cytoscape.js.
+
+Usage:
+    python app.py
+
+Then open http://localhost:8050 in your browser.
+"""
+
+import json
+import os
+import dash
+from dash import dcc, html, Input, Output, State, ctx, clientside_callback
+import dash_cytoscape as cyto
+
+# Load extra layouts (CoSE-Bilkent, Dagre, etc.) — must be called before app creation
+cyto.load_extra_layouts()
+
+# ---------------------------------------------------------------------------
+# 1.  Parse Lucidchart JSON
+# ---------------------------------------------------------------------------
+
+# Shape classes to exclude (non-graph decorations)
+_EXCLUDE_CLASSES = {"PresentationFrameBlock", "LegendBlockV2"}
+
+# Map Lucidchart class names → semantic type labels used in the UI
+_TYPE_LABELS = {
+    "DataBlockNew":  "Compound",
+    "ProcessBlock":  "Reaction / Reagent",
+    "MergeBlock":    "Decision",
+}
+
+
+def _get_primary_text(text_areas: list) -> str:
+    """Return the first non-empty text value from a textAreas list."""
+    for ta in text_areas:
+        t = ta.get("text", "").strip()
+        if t:
+            return t
+    return ""
+
+
+def parse_lucidchart(filepath: str) -> tuple[list, list]:
+    """
+    Read a Lucidchart JSON export and return
+        (cytoscape_nodes, cytoscape_edges)
+    both as plain dicts ready for dash-cytoscape.
+    """
+    with open(filepath, encoding="utf-8") as fh:
+        data = json.load(fh)
+
+    page = data["pages"][0]
+    raw_shapes = page["items"]["shapes"]
+    raw_lines  = page["items"]["lines"]
+
+    # Build a set of valid shape IDs (after filtering) so we can skip
+    # edges that reference excluded/frame nodes.
+    valid_ids = {
+        s["id"] for s in raw_shapes
+        if s["class"] not in _EXCLUDE_CLASSES
+    }
+
+    # --- Nodes ---
+    nodes = []
+    for shape in raw_shapes:
+        if shape["class"] in _EXCLUDE_CLASSES:
+            continue
+
+        label    = _get_primary_text(shape.get("textAreas", []))
+        ntype    = shape["class"]                        # ProcessBlock | DataBlockNew | MergeBlock
+        custom   = shape.get("customData",  [])
+        linked   = shape.get("linkedData",  [])
+
+        nodes.append({
+            "data": {
+                "id":          shape["id"],
+                "label":       label,
+                "node_type":   ntype,
+                # Future-proof slots for rich content
+                "notes":       "",
+                "dois":        [],
+                "image_urls":  [],
+                "mol_url":     "",
+                # Raw metadata preserved for extensibility
+                "custom_data": custom,
+                "linked_data": linked,
+            }
+        })
+
+    # --- Edges ---
+    edges = []
+    for line in raw_lines:
+        ep1 = line["endpoint1"]
+        ep2 = line["endpoint2"]
+
+        src_id = ep1["connectedTo"]
+        tgt_id = ep2["connectedTo"]
+
+        # Skip if either endpoint is an excluded/frame shape
+        if src_id not in valid_ids or tgt_id not in valid_ids:
+            continue
+
+        # Determine canonical direction:
+        # The endpoint with an arrow style is the "tip" (target).
+        ep1_arrow = ep1["style"] not in ("None", "")
+        ep2_arrow = ep2["style"] not in ("None", "")
+
+        if ep1_arrow and not ep2_arrow:
+            # Arrow is at ep1 → ep1 is the target, flip
+            src_id, tgt_id = tgt_id, src_id
+
+        is_bidirectional = ep1_arrow and ep2_arrow
+
+        # Edge label (e.g. "Yes", "No", "Primary", "Secondary", "Tertiary")
+        edge_label = _get_primary_text(line.get("textAreas", []))
+
+        # Arrow style drives visual rendering (dashed vs solid)
+        arrow_style = ep2["style"] if not (ep1_arrow and not ep2_arrow) else ep1["style"]
+
+        edges.append({
+            "data": {
+                "id":             line["id"],
+                "source":         src_id,
+                "target":         tgt_id,
+                "label":          edge_label,
+                "arrow_style":    arrow_style,
+                "bidirectional":  is_bidirectional,
+            }
+        })
+
+    return nodes, edges
+
+
+# ---------------------------------------------------------------------------
+# 2.  Load graph data
+# ---------------------------------------------------------------------------
+
+_DATA_PATH = os.path.join(os.path.dirname(__file__), "CHEM740_ReactionMap.json")
+NODES, EDGES = parse_lucidchart(_DATA_PATH)
+
+# Pre-build a lookup dict for detail-panel use
+NODE_BY_ID = {n["data"]["id"]: n["data"] for n in NODES}
+
+
+# ---------------------------------------------------------------------------
+# 3.  Cytoscape stylesheet
+# ---------------------------------------------------------------------------
+
+STYLESHEET = [
+    # ---- Base node style ----
+    {
+        "selector": "node",
+        "style": {
+            "label":          "data(label)",
+            "text-wrap":      "wrap",
+            "text-max-width": "130px",
+            "font-size":      "11px",
+            "font-family":    "sans-serif",
+            "text-valign":    "center",
+            "text-halign":    "center",
+            "width":          "label",
+            "height":         "label",
+            "padding":        "8px",
+            "border-width":   1.5,
+            "border-opacity": 0.85,
+            "transition-property":  "background-color border-width border-color",
+            "transition-duration":  "0.15s",
+        },
+    },
+    # ---- Compound nodes (DataBlockNew) — green ----
+    {
+        "selector": "node[node_type = 'DataBlockNew']",
+        "style": {
+            "background-color": "#1D9E75",
+            "border-color":     "#0F6E56",
+            "color":            "#04342C",
+        },
+    },
+    # ---- Reaction/reagent nodes (ProcessBlock) — blue ----
+    {
+        "selector": "node[node_type = 'ProcessBlock']",
+        "style": {
+            "background-color": "#378ADD",
+            "border-color":     "#185FA5",
+            "color":            "#042C53",
+        },
+    },
+    # ---- Decision nodes (MergeBlock) — amber diamond ----
+    {
+        "selector": "node[node_type = 'MergeBlock']",
+        "style": {
+            "background-color": "#EF9F27",
+            "border-color":     "#854F0B",
+            "color":            "#412402",
+            "shape":            "diamond",
+            "font-weight":      "bold",
+        },
+    },
+    # ---- Selected node ----
+    {
+        "selector": "node:selected",
+        "style": {
+            "border-width":   3,
+            "border-color":   "#E24B4A",
+            "border-opacity": 1,
+        },
+    },
+    # ---- Search highlight: all matches (amber ring) ----
+    {
+        "selector": "node.search-match",
+        "style": {
+            "border-width":     3,
+            "border-color":     "#EF9F27",
+            "border-opacity":   1,
+        },
+    },
+    # ---- Search highlight: current match (red ring + scale) ----
+    {
+        "selector": "node.search-current",
+        "style": {
+            "border-width":     4,
+            "border-color":     "#E24B4A",
+            "border-opacity":   1,
+            "background-color": "#F7C1C1",
+        },
+    },
+    # ---- Base edge style ----
+    {
+        "selector": "edge",
+        "style": {
+            "curve-style":          "bezier",
+            "target-arrow-shape":   "triangle",
+            "target-arrow-color":   "#888780",
+            "arrow-scale":          0.9,
+            "line-color":           "#B4B2A9",
+            "width":                1.5,
+            "label":                "data(label)",
+            "font-size":            "9px",
+            "color":                "#5F5E5A",
+            "font-family":          "sans-serif",
+            "text-background-color":   "white",
+            "text-background-opacity": 0.8,
+            "text-background-padding": "2px",
+        },
+    },
+    # ---- Dashed edges (Open Arrow style in Lucid = reversible/equilibrium) ----
+    {
+        "selector": "edge[arrow_style = 'Open Arrow']",
+        "style": {
+            "line-style":       "dashed",
+            "line-dash-pattern": [6, 3],
+            "target-arrow-shape": "vee",
+        },
+    },
+    # ---- Bidirectional edges ----
+    {
+        "selector": "edge[?bidirectional]",
+        "style": {
+            "source-arrow-shape": "triangle",
+            "source-arrow-color": "#888780",
+        },
+    },
+]
+
+# ---------------------------------------------------------------------------
+# 4.  Layout presets
+# ---------------------------------------------------------------------------
+
+LAYOUTS = {
+    "cose-bilkent": {
+        "name":            "cose-bilkent",
+        "animate":         True,
+        "animationDuration": 800,
+        "randomize":       True,
+        "nodeRepulsion":   9000,
+        "idealEdgeLength": 110,
+        "edgeElasticity":  0.45,
+        "nestingFactor":   0.1,
+        "gravity":         0.25,
+        "numIter":         2500,
+        "tile":            True,
+        "tilingPaddingVertical":   10,
+        "tilingPaddingHorizontal": 10,
+    },
+    "cose": {
+        "name":    "cose",
+        "animate": True,
+        "randomize": True,
+        "nodeRepulsion": 8000,
+        "idealEdgeLength": 100,
+    },
+    "dagre": {
+        "name":    "dagre",
+        "animate": True,
+        "rankDir": "TB",
+        "nodeSep": 60,
+        "rankSep": 90,
+        "padding": 20,
+    },
+    "breadthfirst": {
+        "name":     "breadthfirst",
+        "animate":  True,
+        "directed": True,
+        "padding":  30,
+        "spacingFactor": 1.5,
+    },
+    "circle":  {"name": "circle",  "animate": True},
+    "random":  {"name": "random",  "animate": True},
+    "cola": {
+        "name": "cola",
+        "animate": True,
+        "maxSimulationTime": 4000,
+        "nodeSpacing": 12,
+        "edgeLengthVal": 100,
+        "flow": {"axis": "y", "minSeparation": 30},  # top-to-bottom flow bias
+    },
+    "fcose": {
+        "name": "fcose",
+        "animate": True,
+        "randomize": True,
+        "nodeRepulsion": 9000,
+        "idealEdgeLength": 100,
+        "edgeElasticity": 0.45,
+        "numIter": 2500,
+    },
+}
+
+# ---------------------------------------------------------------------------
+# 5.  App layout
+# ---------------------------------------------------------------------------
+
+app = dash.Dash(
+    __name__,
+    title="CHEM740 Reaction Map",
+    suppress_callback_exceptions=True,
+)
+
+_PANEL_BASE_STYLE = {
+    "position":    "absolute",
+    "top":         "54px",
+    "right":       "0",
+    "width":       "300px",
+    "height":      "calc(100vh - 54px)",
+    "background":  "white",
+    "borderLeft":  "1px solid #ddd",
+    "padding":     "18px 16px 18px 18px",
+    "boxShadow":   "-3px 0 12px rgba(0,0,0,0.08)",
+    "overflowY":   "auto",
+    "zIndex":      "20",
+}
+
+app.layout = html.Div(
+    style={"fontFamily": "system-ui, sans-serif", "height": "100vh", "overflow": "hidden"},
+    children=[
+
+        # ---- Toolbar ----
+        html.Div(
+            style={
+                "display": "flex", "alignItems": "center", "gap": "16px",
+                "padding": "0 16px", "height": "54px",
+                "background": "#f8f8f6", "borderBottom": "1px solid #ddd",
+                "flexShrink": "0",
+            },
+            children=[
+                html.Span(
+                    "CHEM740 Reaction Map",
+                    style={"fontWeight": "500", "fontSize": "15px", "marginRight": "8px"},
+                ),
+
+                # Search input
+                dcc.Input(
+                    id="search-input",
+                    type="text",
+                    placeholder="Search nodes…",
+                    debounce=False,
+                    style={
+                        "padding": "5px 10px", "borderRadius": "6px",
+                        "border": "1px solid #ccc", "fontSize": "13px", "width": "200px",
+                    },
+                ),
+                html.Button("◀", id="prev-match", n_clicks=0, title="Previous match",
+                    style={"padding": "4px 9px", "borderRadius": "4px", "border": "1px solid #ccc",
+                           "cursor": "pointer", "fontSize": "13px"}),
+                html.Span(id="match-counter", children="",
+                    style={"fontSize": "12px", "color": "#888", "minWidth": "60px", "textAlign": "center"}),
+                html.Button("▶", id="next-match", n_clicks=0, title="Next match",
+                    style={"padding": "4px 9px", "borderRadius": "4px", "border": "1px solid #ccc",
+                           "cursor": "pointer", "fontSize": "13px"}),
+
+                html.Div(style={"flex": "1"}),  # spacer
+
+                # Layout dropdown
+                html.Label("Layout:", style={"fontSize": "12px", "whiteSpace": "nowrap"}),
+                dcc.Dropdown(
+                    id="layout-selector",
+                    options=[
+                        {"label": "CoSE-Bilkent (physics)",   "value": "cose-bilkent"},
+                        {"label": "fcose",   "value": "fcose"},
+                        {"label": "cola",   "value": "cola"},
+                        {"label": "CoSE (fast physics)",       "value": "cose"},
+                        {"label": "Dagre (hierarchical)",      "value": "dagre"},
+                        {"label": "Breadth-first (directed)",  "value": "breadthfirst"},
+                        {"label": "Circle",                    "value": "circle"},
+                        {"label": "Random",                    "value": "random"},
+                    ],
+                    value="cose-bilkent",
+                    clearable=False,
+                    style={"width": "210px", "fontSize": "12px"},
+                ),
+
+                # Fit button
+                html.Button("⊡ Fit", id="fit-btn", n_clicks=0, title="Fit entire graph in view",
+                    style={"padding": "5px 10px", "borderRadius": "4px", "border": "1px solid #ccc",
+                           "cursor": "pointer", "fontSize": "12px"}),
+            ],
+        ),
+
+        # ---- Main area (graph + sliding panel) ----
+        html.Div(
+            style={"position": "relative", "flex": "1"},
+            children=[
+
+                cyto.Cytoscape(
+                    id="cytoscape",
+                    elements=NODES + EDGES,
+                    layout=LAYOUTS["cose-bilkent"],
+                    stylesheet=STYLESHEET,
+                    style={"width": "100%", "height": "calc(100vh - 54px)"},
+                    minZoom=0.05,
+                    maxZoom=4.0,
+                    boxSelectionEnabled=True,
+                    responsive=True,
+                    userZoomingEnabled=True,
+                    userPanningEnabled=True,
+                ),
+
+                # ---- Node detail slide-in panel ----
+                html.Div(
+                    id="detail-panel",
+                    style={**_PANEL_BASE_STYLE, "display": "none"},
+                    children=[
+                        html.Button(
+                            "✕", id="close-panel", n_clicks=0,
+                            title="Close",
+                            style={
+                                "position": "absolute", "top": "10px", "right": "12px",
+                                "background": "none", "border": "none",
+                                "fontSize": "18px", "cursor": "pointer",
+                                "color": "#888", "lineHeight": "1",
+                            },
+                        ),
+                        html.Div(id="detail-content"),
+                    ],
+                ),
+            ],
+        ),
+
+        # ---- Hidden state stores ----
+        dcc.Store(id="search-matches", data=[]),
+        dcc.Store(id="search-index",   data=0),
+    ],
+)
+
+# ---------------------------------------------------------------------------
+# 6.  Callbacks
+# ---------------------------------------------------------------------------
+
+# 6a. Compute search matches whenever query changes
+@app.callback(
+    Output("search-matches", "data"),
+    Output("search-index",   "data"),
+    Output("match-counter",  "children"),
+    Input("search-input", "value"),
+)
+def update_search(query):
+    if not query or len(query.strip()) < 2:
+        return [], 0, ""
+
+    q = query.strip().lower()
+    matches = [
+        n["data"]["id"]
+        for n in NODES
+        if q in n["data"]["label"].lower()
+    ]
+
+    if not matches:
+        return [], 0, "0 matches"
+
+    return matches, 0, f"1 / {len(matches)}"
+
+
+# 6b. Cycle through matches with ◀ / ▶
+@app.callback(
+    Output("search-index",  "data",    allow_duplicate=True),
+    Output("match-counter", "children", allow_duplicate=True),
+    Input("next-match", "n_clicks"),
+    Input("prev-match", "n_clicks"),
+    State("search-matches", "data"),
+    State("search-index",   "data"),
+    prevent_initial_call=True,
+)
+def cycle_matches(next_clicks, prev_clicks, matches, current_idx):
+    if not matches:
+        return current_idx, ""
+
+    triggered = ctx.triggered_id
+    if triggered == "next-match":
+        new_idx = (current_idx + 1) % len(matches)
+    else:
+        new_idx = (current_idx - 1) % len(matches)
+
+    return new_idx, f"{new_idx + 1} / {len(matches)}"
+
+
+# 6c. Update stylesheet to show search highlights
+@app.callback(
+    Output("cytoscape", "stylesheet"),
+    Input("search-matches", "data"),
+    Input("search-index",   "data"),
+)
+def update_highlights(matches, idx):
+    if not matches:
+        return STYLESHEET
+
+    current_id = matches[idx]
+
+    extra = []
+    for m in matches:
+        cls = "search-current" if m == current_id else "search-match"
+        extra.append({
+            "selector": f"node[id = '{m}']",
+            "style": STYLESHEET[
+                # Reuse the pre-defined class styles
+                next(i for i, s in enumerate(STYLESHEET) if s["selector"] == f"node.{cls}")
+            ]["style"],
+        })
+
+    return STYLESHEET + extra
+
+
+# 6d. Pan/zoom to the current search match using a clientside callback
+#     (avoids a round-trip; uses Cytoscape.js .fit() directly in the browser)
+clientside_callback(
+    """
+    function(matches, idx, elements) {
+        if (!matches || matches.length === 0) return window.dash_clientside.no_update;
+
+        var targetId = matches[idx];
+
+        // Find the cytoscape instance — dash-cytoscape registers itself on a global
+        // accessible via the component's DOM node.
+        var cyEl = document.getElementById('cytoscape');
+        if (!cyEl) return window.dash_clientside.no_update;
+
+        // Cytoscape stores the instance on the element as _cyreg (internal dash-cytoscape)
+        var cy = cyEl._cyreg ? cyEl._cyreg.cy : null;
+
+        if (!cy) {
+            // Try the newer dash-cytoscape API
+            var reactFiber = cyEl[Object.keys(cyEl).find(k => k.startsWith('__reactFiber'))];
+            var inst = reactFiber;
+            while (inst) {
+                if (inst.stateNode && inst.stateNode.cy) {
+                    cy = inst.stateNode.cy;
+                    break;
+                }
+                inst = inst.return;
+            }
+        }
+
+        if (!cy) return window.dash_clientside.no_update;
+
+        var target = cy.getElementById(targetId);
+        if (target && target.length > 0) {
+            cy.animate({
+                fit: { eles: target, padding: 150 },
+                duration: 600,
+                easing: 'ease-in-out-cubic',
+            });
+        }
+
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("cytoscape", "zoom"),   # dummy output (we use no_update)
+    Input("search-matches", "data"),
+    Input("search-index",   "data"),
+    State("cytoscape", "elements"),
+    prevent_initial_call=True,
+)
+
+
+# 6e. Fit-all button
+clientside_callback(
+    """
+    function(n_clicks) {
+        if (!n_clicks) return window.dash_clientside.no_update;
+        var cyEl = document.getElementById('cytoscape');
+        if (!cyEl) return window.dash_clientside.no_update;
+        var cy = cyEl._cyreg ? cyEl._cyreg.cy : null;
+        if (cy) cy.fit(undefined, 30);
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("cytoscape", "pan"),   # dummy output
+    Input("fit-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+
+
+# 6f. Show node detail panel on click
+@app.callback(
+    Output("detail-panel",  "style"),
+    Output("detail-content", "children"),
+    Input("cytoscape",   "tapNodeData"),
+    Input("close-panel", "n_clicks"),
+    prevent_initial_call=True,
+)
+def show_node_detail(node_data, _close):
+    triggered = ctx.triggered_id
+
+    if triggered == "close-panel" or not node_data:
+        return {**_PANEL_BASE_STYLE, "display": "none"}, []
+
+    nid    = node_data.get("id", "")
+    label  = node_data.get("label", "—")
+    ntype  = node_data.get("node_type", "")
+
+    type_meta = {
+        "DataBlockNew":  ("Compound",          "#0F6E56"),
+        "ProcessBlock":  ("Reaction / Reagent", "#185FA5"),
+        "MergeBlock":    ("Decision",           "#854F0B"),
+    }
+    type_label, type_color = type_meta.get(ntype, ("Node", "#888"))
+
+    # Count connections from global edge list
+    degree = sum(
+        1 for e in EDGES
+        if e["data"]["source"] == nid or e["data"]["target"] == nid
+    )
+    in_deg  = sum(1 for e in EDGES if e["data"]["target"] == nid)
+    out_deg = sum(1 for e in EDGES if e["data"]["source"] == nid)
+
+    def section(title, body):
+        return html.Div(
+            style={"marginBottom": "14px"},
+            children=[
+                html.Div(title, style={
+                    "fontSize": "11px", "fontWeight": "500",
+                    "color": "#888", "textTransform": "uppercase",
+                    "letterSpacing": "0.4px", "marginBottom": "4px",
+                }),
+                body,
+            ],
+        )
+
+    # ---- Future rich-content placeholders ----
+    # These will be populated once you add data to the JSON or a companion
+    # metadata file. The keys (notes, dois, image_urls, mol_url) are already
+    # parsed from the JSON for every node.
+    nd      = NODE_BY_ID.get(nid, {})
+    notes   = nd.get("notes") or None
+    dois    = nd.get("dois") or []
+    images  = nd.get("image_urls") or []
+    mol_url = nd.get("mol_url") or None
+
+    doi_items = [
+        html.A(d, href=f"https://doi.org/{d}", target="_blank",
+               style={"display": "block", "fontSize": "12px",
+                      "color": "#185FA5", "marginBottom": "2px"})
+        for d in dois
+    ] or [html.Span("—", style={"fontSize": "13px", "color": "#aaa"})]
+
+    img_items = [
+        html.Img(src=url, style={"maxWidth": "100%", "borderRadius": "4px",
+                                  "marginBottom": "6px"})
+        for url in images
+    ] or [html.Span("—", style={"fontSize": "13px", "color": "#aaa"})]
+
+    mol_item = (
+        html.A("Open molecular model ↗", href=mol_url, target="_blank",
+               style={"fontSize": "12px", "color": "#185FA5"})
+        if mol_url
+        else html.Span("—", style={"fontSize": "13px", "color": "#aaa"})
+    )
+
+    content = [
+        # Type badge
+        html.Div(type_label, style={
+            "fontSize": "10px", "fontWeight": "600", "color": type_color,
+            "textTransform": "uppercase", "letterSpacing": "0.6px",
+            "marginBottom": "4px",
+        }),
+        # Node label / title
+        html.H3(label, style={
+            "margin": "0 24px 10px 0",
+            "fontSize": "15px", "fontWeight": "500", "lineHeight": "1.4",
+        }),
+        html.Hr(style={"border": "none", "borderTop": "1px solid #eee", "margin": "8px 0 12px"}),
+
+        # Connectivity stats
+        section("Connections", html.Div([
+            html.Span(f"↑ {out_deg} out  ", style={"fontSize": "12px", "color": "#555"}),
+            html.Span(f"↓ {in_deg} in",      style={"fontSize": "12px", "color": "#555"}),
+        ])),
+
+        # Notes
+        section("Notes",
+            html.Div(notes or "—",
+                style={"fontSize": "13px", "color": "#555" if notes else "#aaa",
+                       "lineHeight": "1.5"})),
+
+        # DOI links
+        section("DOIs / References", html.Div(doi_items)),
+
+        # Images
+        section("Images", html.Div(img_items)),
+
+        # Molecular model
+        section("Molecular Model", mol_item),
+    ]
+
+    return {**_PANEL_BASE_STYLE, "display": "block"}, content
+
+
+# 6g. Switch layout
+@app.callback(
+    Output("cytoscape", "layout"),
+    Input("layout-selector", "value"),
+    prevent_initial_call=True,
+)
+def update_layout(name):
+    return LAYOUTS.get(name, {"name": name, "animate": True})
+
+
+# ---------------------------------------------------------------------------
+# 7.  Run
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    app.run(
+        debug=False,
+        host="0.0.0.0",   # accessible from other machines on the local network
+        port=8050,
+    )
